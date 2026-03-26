@@ -14,8 +14,12 @@
 using namespace std;
 
 // ================= 配置区域 =================
-const string CORRECT_PASS = "admin123"; 
-const string PASS_FILE = "D:\\rjkillerauthpass";
+const string CORRECT_PASS = "admin123";          // 授权密码
+const string PASS_FILE = "D:\\rjkillerauthpass"; // 授权文件路径
+
+const bool CREATE_AUTH_FILE = true;  // 【开关】是否创建授权文件 (false则每次运行都需输密码)
+const bool USE_HWID_BIND = true;     // 【开关】是否启用HWID硬件绑定 (false则只验证密码，不验证机器)
+
 // ===========================================
 
 // --- 辅助函数 ---
@@ -37,19 +41,19 @@ string GetSHA256(const string& input) {
     return result;
 }
 
-// --- 核心修复：稳定的 HWID 生成 ---
+// --- HWID 生成 ---
 string GenerateHWID() {
     string rawFeatures = "";
     char buffer[512];
 
-    // 1. 获取 D 盘卷序列号
+    // 1. D盘序列号
     DWORD volSerial = 0;
     if (GetVolumeInformationA("D:\\", NULL, 0, &volSerial, NULL, NULL, NULL, 0)) {
         wsprintf(buffer, "[DISK:%08X]", volSerial);
         rawFeatures += buffer;
     }
 
-    // 2. 获取 D 盘文件特征 (排序)
+    // 2. D盘文件特征 (排序)
     WIN32_FIND_DATAA findData;
     HANDLE hFind = FindFirstFileA("D:\\*", &findData);
     vector<string> fileList;
@@ -62,8 +66,7 @@ string GenerateHWID() {
         FindClose(hFind);
     }
 
-    sort(fileList.begin(), fileList.end()); // 关键：排序防止顺序变化
-
+    sort(fileList.begin(), fileList.end()); 
     for (size_t i = 0; i < fileList.size() && i < 3; i++) {
         rawFeatures += "[FILE:" + fileList[i] + "]";
     }
@@ -73,9 +76,6 @@ string GenerateHWID() {
     if (GetComputerNameA(compName, &size)) {
         rawFeatures += "[PC:" + string(compName) + "]";
     }
-
-    // 调试输出
-    cout << "[DEBUG] 机器特征: " << rawFeatures << endl;
 
     return GetSHA256(rawFeatures);
 }
@@ -169,31 +169,47 @@ DWORD WINAPI KillThread(LPVOID lpParam) {
 int main() {
     if (!IsRunAsAdmin()) { cout << "[提示] 正在请求管理员权限..." << endl; ElevateNow(); return 0; }
     EnableDebugPrivilege();
-    cout << "RJKiller ver1.4 Final Fix by zt3927" << endl;
+    cout << "RJKiller ver1.5 Config Edition by zt3927" << endl;
 
-    // 1. 计算 HWID
-    string currentHWID = GenerateHWID();
-    cout << "[*] 当前 HWID: " << currentHWID << endl;
+    // 1. HWID 处理
+    string currentHWID = "";
+    if (USE_HWID_BIND) {
+        currentHWID = GenerateHWID();
+        cout << "[*] 模式: HWID绑定 | 当前ID: " << currentHWID << endl;
+    } else {
+        cout << "[*] 模式: 密码验证 (无硬件绑定)" << endl;
+    }
 
-    // 2. 验证文件
+    // 2. 验证逻辑
     bool isAuthorized = false;
-    string line1, line2;
     
-    ifstream checkFile(PASS_FILE.c_str());
-    if (checkFile.is_open()) {
-        getline(checkFile, line1);
-        getline(checkFile, line2);
-        checkFile.close();
-
-        if (line1 == "Authorized" && line2 == currentHWID) {
-            isAuthorized = true;
-            cout << "[信息] 授权验证通过。" << endl;
-        } else {
-            cout << "[警告] 授权文件无效或 HWID 不匹配。" << endl;
+    // 只有当允许创建文件时，才尝试读取文件验证
+    if (CREATE_AUTH_FILE) {
+        ifstream checkFile(PASS_FILE.c_str());
+        if (checkFile.is_open()) {
+            string line1, line2;
+            getline(checkFile, line1);
+            
+            if (USE_HWID_BIND) {
+                getline(checkFile, line2); // 读取第二行 HWID
+                if (line1 == "Authorized" && line2 == currentHWID) {
+                    isAuthorized = true;
+                    cout << "[信息] 授权文件验证通过。" << endl;
+                } else {
+                    cout << "[警告] 授权文件无效或HWID不匹配。" << endl;
+                }
+            } else {
+                // 不绑定HWID时，只检查第一行
+                if (line1 == "Authorized") {
+                    isAuthorized = true;
+                    cout << "[信息] 授权文件验证通过。" << endl;
+                }
+            }
+            checkFile.close();
         }
     }
 
-    // 3. 重新授权流程
+    // 3. 密码输入与写入
     if (!isAuthorized) {
         cout << "授权密码: ";
         string inputPass;
@@ -205,20 +221,25 @@ int main() {
             return 1;
         }
 
-        // 【修复关键】先取消隐藏和系统属性，防止写入失败！
-        SetFileAttributesA(PASS_FILE.c_str(), FILE_ATTRIBUTE_NORMAL);
-
-        ofstream createFile(PASS_FILE.c_str());
-        if (createFile.is_open()) {
-            createFile << "Authorized" << endl;
-            createFile << currentHWID << endl; // 写入最新的 HWID
-            createFile.close();
+        // 密码正确，判断是否需要保存文件
+        if (CREATE_AUTH_FILE) {
+            // 去除属性以确保能写入
+            SetFileAttributesA(PASS_FILE.c_str(), FILE_ATTRIBUTE_NORMAL);
             
-            // 再次隐藏
-            SetFileAttributesA(PASS_FILE.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
-            cout << "[成功] 授权文件已更新并绑定 HWID。" << endl;
+            ofstream createFile(PASS_FILE.c_str());
+            if (createFile.is_open()) {
+                createFile << "Authorized" << endl;
+                if (USE_HWID_BIND) {
+                    createFile << currentHWID << endl; // 写入 HWID
+                }
+                createFile.close();
+                
+                // 重新隐藏
+                SetFileAttributesA(PASS_FILE.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+                cout << "[成功] 授权已保存。" << endl;
+            }
         } else {
-            cout << "[错误] 无法写入授权文件！请检查 D 盘权限。" << endl;
+            cout << "[信息] 密码正确 (本次运行有效)。" << endl;
         }
     }
 
